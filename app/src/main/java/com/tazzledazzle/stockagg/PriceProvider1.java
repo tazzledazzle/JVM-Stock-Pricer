@@ -10,13 +10,13 @@ import java.util.function.Consumer;
  * write blocking code" viable at thousands-of-tasks scale, since the JVM
  * parks the virtual thread (cheaply) instead of pinning an OS thread.
  */
-public class PriceProvider {
+public class PriceProvider1 {
 
     private final String name;
     private final double basePrice;
     private final Integer flakyEveryNTicks; // null = never stalls
 
-    public PriceProvider(String name, double basePrice, Integer flakyEveryNTicks) {
+    public PriceProvider1(String name, double basePrice, Integer flakyEveryNTicks) {
         this.name = name;
         this.basePrice = basePrice;
         this.flakyEveryNTicks = flakyEveryNTicks;
