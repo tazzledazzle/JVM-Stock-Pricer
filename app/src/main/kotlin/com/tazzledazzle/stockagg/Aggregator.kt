@@ -1,86 +1,125 @@
 package com.tazzledazzle.stockagg
 
+import com.tazzledazzle.aggregator.CircuitBreaker
+import com.tazzledazzle.aggregator.CircuitState
+import com.tazzledazzle.aggregator.withRetry
 import com.tazzledazzle.stockagg.model.AggregatedPrice
-import com.tazzledazzle.stockagg.model.Tick
+import com.tazzledazzle.stockagg.model.PriceHistory
+import com.tazzledazzle.stockagg.model.PricePoint
+import com.tazzledazzle.stockagg.model.ProviderReading
+import com.tazzledazzle.stockagg.providers.PriceProvider
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.produceIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.collections.toList
-import kotlin.time.Duration.Companion.milliseconds
 
-/**
- * Aggregates concurrent provider streams per symbol into a single cached
- * [AggregatedPrice], and broadcasts every update over a [SharedFlow] for
- * WebSocket fan-out.
- *
- * Concurrency shape:
- *  - one parent coroutine per symbol (launched in [start])
- *  - inside a `supervisorScope`, one child coroutine per provider
- *  - each provider's flow is turned into a channel via `produceIn`, so
- *    waiting for its next tick can be raced against `withTimeoutOrNull` --
- *    a stalled provider just gets skipped for a beat, nothing else blocks
- *  - `supervisorScope` means one provider throwing an exception does not
- *    cancel its siblings (the bulkhead requirement from the NFRs)
- */
 class Aggregator(
     private val providers: List<PriceProvider>,
-    private val perTickTimeoutMillis: Long = 1_000
+    private val symbols: List<String>,
+    private val pollIntervalMs: Long,
+    private val providerTimeoutMs: Long,
+    private val maxRetries: Int,
+    private val retryBaseDelayMs: Long,
+    private val historySize: Int,
+    circuitBreakerFailureThreshold: Int,
+    circuitBreakerResetMs: Long
 ) {
     private val cache = ConcurrentHashMap<String, AggregatedPrice>()
+    private val history = ConcurrentHashMap<String, ArrayDeque<PricePoint>>()
+    private val circuitBreaker = CircuitBreaker(circuitBreakerFailureThreshold, circuitBreakerResetMs)
 
-    private val _updates = MutableSharedFlow<AggregatedPrice>(replay = 0, extraBufferCapacity = 64)
+    private val _updates = MutableSharedFlow<AggregatedPrice>(extraBufferCapacity = 64)
     val updates: SharedFlow<AggregatedPrice> = _updates.asSharedFlow()
 
-    fun latest(symbol: String): AggregatedPrice? = cache[symbol]
-    fun allLatest(): List<AggregatedPrice> = cache.values.toList()
-
-    /** Launches the ingestion pipeline for a symbol. Runs until [scope] is cancelled. */
-    fun start(scope: CoroutineScope, symbol: String) {
-        scope.launch {
-            // Latest tick seen per provider for this symbol; recomputed into
-            // an average whenever any provider reports a fresh tick.
-            val latestByProvider = ConcurrentHashMap<String, Tick>()
-
-            supervisorScope {
-                providers.forEach { provider ->
-                    launch {
-                        // produceIn starts the provider's flow eagerly in its own
-                        // child coroutine, decoupled from how fast we consume it.
-                        // That lets us race "wait for the next tick" against a
-                        // timeout: if the provider stalls (our simulated flaky
-                        // tick), we simply skip a beat for THIS provider only --
-                        // the channel keeps buffering, and other providers'
-                        // coroutines are completely unaffected.
-                        val channel = provider.ticks(symbol).produceIn(this)
-                        while (true) {
-                            val tick = withTimeoutOrNull(perTickTimeoutMillis.milliseconds) {
-                                channel.receive()
-                            } ?: continue // this provider stalled past the SLA; try again next beat
-
-                            latestByProvider[provider.name] = tick
-
-                            val samples = latestByProvider.values.toList()
-                            val avg = samples.map { it.price }.average()
-                            val aggregated = AggregatedPrice(
-                                symbol = symbol,
-                                price = avg,
-                                sampleCount = samples.size,
-                                providers = samples.map { it.provider },
-                                asOfMillis = System.currentTimeMillis(),
-                                staleMillis = 0
-                            )
-                            cache[symbol] = aggregated
-                            _updates.emit(aggregated)
-                        }
-                    }
-                }
-            }
+    /** Launches one independent poll loop per symbol on [scope]. Failures in one loop
+     *  (or one provider within a loop) never cancel the others - supervisorScope below
+     *  is the bulkhead boundary. */
+    fun start(scope: CoroutineScope) {
+        symbols.forEach { symbol ->
+            scope.launch { pollLoop(symbol) }
         }
     }
+
+    private suspend fun CoroutineScope.pollLoop(symbol: String) {
+        while (isActive) {
+            val readings = supervisorScope {
+                providers.map { provider ->
+                    async { fetchFromProvider(provider, symbol) }
+                }.awaitAll().filterNotNull()
+            }
+
+            if (readings.isNotEmpty()) {
+                val avgPrice = readings.sumOf { it.price } / readings.size
+                val latestTs = readings.maxOf { it.timestamp }
+                val aggregated = AggregatedPrice(
+                    symbol = symbol,
+                    price = avgPrice,
+                    timestamp = latestTs,
+                    sources = readings.map { it.source }
+                )
+                cache[symbol] = aggregated
+                appendHistory(symbol, PricePoint(latestTs, avgPrice))
+                _updates.emit(aggregated)
+            } else {
+                // Every provider failed or was circuit-open this tick - degrade to the
+                // last known price with a staleness flag, never a 500 to the client.
+                cache[symbol]?.let { last ->
+                    val stale = last.copy(staleMillis = System.currentTimeMillis() - last.timestamp)
+                    cache[symbol] = stale
+                    _updates.emit(stale)
+                }
+            }
+
+            delay(pollIntervalMs)
+        }
+    }
+
+    private suspend fun fetchFromProvider(provider: PriceProvider, symbol: String): ProviderReading? {
+        val key = "${provider.name}:$symbol"
+        if (!circuitBreaker.allowRequest(key)) return null
+
+        return try {
+            val reading = withTimeoutOrNull(providerTimeoutMs) {
+                withRetry(maxRetries, retryBaseDelayMs) { provider.fetch(symbol) }
+            }
+            if (reading != null) {
+                circuitBreaker.recordSuccess(key)
+                reading
+            } else {
+                circuitBreaker.recordFailure(key)
+                null
+            }
+        } catch (e: Exception) {
+            circuitBreaker.recordFailure(key)
+            null
+        }
+    }
+
+    private fun appendHistory(symbol: String, point: PricePoint) {
+        val deque = history.computeIfAbsent(symbol) { ArrayDeque() }
+        synchronized(deque) {
+            deque.addLast(point)
+            while (deque.size > historySize) deque.removeFirst()
+        }
+    }
+
+    fun latest(symbol: String): AggregatedPrice? = cache[symbol]
+
+    fun allLatest(): List<AggregatedPrice> = cache.values.toList()
+
+    fun historyOf(symbol: String): PriceHistory {
+        val points = history[symbol]?.let { synchronized(it) { it.toList() } } ?: emptyList()
+        return PriceHistory(symbol, points)
+    }
+
+    fun circuitStateOf(providerName: String, symbol: String): CircuitState =
+        circuitBreaker.stateOf("$providerName:$symbol")
 }

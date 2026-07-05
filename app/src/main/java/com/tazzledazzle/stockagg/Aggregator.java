@@ -34,7 +34,7 @@ import java.util.function.Consumer;
  * enough that the JVM schedules them onto a small pool of carrier threads.
  */
 @Component
-public class Aggregator {
+public class JAggregator {
 
     private final List<PriceProvider> providers;
     private final long perTickTimeoutMillis;
