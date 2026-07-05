@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Live Stock Price Aggregator</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            margin: 2rem;
+            background: #0f172a;
+            color: #e2e8f0;
+        }
+        h1 { font-weight: 600; margin-bottom: 0.25rem; }
+        #status { font-size: 0.85rem; color: #94a3b8; margin-bottom: 1.25rem; }
+        #status.connected { color: #4ade80; }
+        #status.disconnected { color: #f87171; }
+        #chart-container { max-width: 900px; }
+        table { border-collapse: collapse; margin-top: 1.5rem; min-width: 480px; }
+        td, th { padding: 0.4rem 0.9rem; border-bottom: 1px solid #334155; text-align: left; }
+        th { color: #94a3b8; font-weight: 500; font-size: 0.85rem; }
+        .stale { color: #fbbf24; }
+    </style>
+</head>
+<body>
+<h1>Live Stock Price Aggregator</h1>
+<div id="status">connecting...</div>
+<div id="chart-container"><canvas id="chart"></canvas></div>
+<table id="latest-table">
+    <thead><tr><th>Symbol</th><th>Price</th><th>Sources</th><th>Updated</th></tr></thead>
+    <tbody></tbody>
+</table>
+
+<script>
+    const MAX_POINTS = 100;
+    const COLORS = ["#38bdf8", "#f472b6", "#a3e635", "#fbbf24", "#c084fc", "#fb7185"];
+    const latestRows = {};
+    let chart;
+
+    function buildChart(symbols) {
+        const datasets = symbols.map((sym, i) => ({
+            label: sym,
+            data: [],
+            borderColor: COLORS[i % COLORS.length],
+            tension: 0.2,
+            pointRadius: 0
+        }));
+
+        chart = new Chart(document.getElementById("chart"), {
+            type: "line",
+            data: { labels: [], datasets },
+            options: {
+                responsive: true,
+                animation: false,
+                scales: {
+                    x: { ticks: { color: "#94a3b8", maxTicksLimit: 10 } },
+                    y: { ticks: { color: "#94a3b8" } }
+                },
+                plugins: { legend: { labels: { color: "#e2e8f0" } } }
+            }
+        });
+    }
+
+    function upsertRow(p) {
+        const tbody = document.querySelector("#latest-table tbody");
+        if (!latestRows[p.symbol]) {
+            const row = document.createElement("tr");
+            row.innerHTML = "<td>" + p.symbol + "</td><td class='price'></td><td class='sources'></td><td class='ts'></td>";
+            tbody.appendChild(row);
+            latestRows[p.symbol] = row;
+        }
+        const row = latestRows[p.symbol];
+        const priceCell = row.querySelector(".price");
+        priceCell.textContent = "$" + p.price.toFixed(2) + (p.staleMillis ? " (stale)" : "");
+        priceCell.className = p.staleMillis ? "price stale" : "price";
+        row.querySelector(".sources").textContent = p.sources.join(", ");
+        row.querySelector(".ts").textContent = new Date(p.timestamp).toLocaleTimeString();
+    }
+
+    function pushPoint(p) {
+        if (!chart) return;
+        const dataset = chart.data.datasets.find((d) => d.label === p.symbol);
+        if (!dataset) return;
+
+        const label = new Date(p.timestamp).toLocaleTimeString();
+        const labels = chart.data.labels;
+        if (labels.length === 0 || labels[labels.length - 1] !== label) {
+            labels.push(label);
+            chart.data.datasets.forEach((d) => {
+                if (d.label !== p.symbol) {
+                    d.data.push(d.data.length ? d.data[d.data.length - 1] : null);
+                }
+            });
+            if (labels.length > MAX_POINTS) {
+                labels.shift();
+                chart.data.datasets.forEach((d) => d.data.shift());
+            }
+        }
+        dataset.data[dataset.data.length - 1] = p.price;
+        chart.update("none");
+    }
+
+    async function loadHistory(symbols) {
+        for (const sym of symbols) {
+            try {
+                const res = await fetch("/prices/" + sym + "/history");
+                const hist = await res.json();
+                hist.points.forEach((pt) => pushPoint({ symbol: sym, price: pt.price, timestamp: pt.timestamp }));
+            } catch (e) {
+                console.error("history load failed for", sym, e);
+            }
+        }
+    }
+
+    function connect() {
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        const ws = new WebSocket(proto + "://" + location.host + "/ws/prices");
+        const status = document.getElementById("status");
+
+        ws.onopen = () => { status.textContent = "connected"; status.className = "connected"; };
+        ws.onclose = () => {
+            status.textContent = "disconnected, retrying...";
+            status.className = "disconnected";
+            setTimeout(connect, 2000);
+        };
+        ws.onerror = () => ws.close();
+        ws.onmessage = (evt) => {
+            const p = JSON.parse(evt.data);
+            upsertRow(p);
+            pushPoint(p);
+        };
+    }
+
+    async function init() {
+        const symbols = await (await fetch("/symbols")).json();
+        buildChart(symbols);
+        await loadHistory(symbols);
+        connect();
+    }
+
+    init();
+</script>
+</body>
+</html>
