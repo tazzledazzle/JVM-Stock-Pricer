@@ -1,7 +1,7 @@
 package com.tazzledazzle.stockagg.providers
 
-import com.tazzledazzle.aggregator.ProviderException
-import com.tazzledazzle.aggregator.ProviderReading
+import com.tazzledazzle.stockagg.model.ProviderException
+import com.tazzledazzle.stockagg.model.ProviderReading
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.request.get
